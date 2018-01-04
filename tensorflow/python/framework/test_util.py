@@ -47,6 +47,7 @@ from tensorflow.core.protobuf import rewriter_config_pb2
 from tensorflow.python import pywrap_tensorflow
 from tensorflow.python.client import device_lib
 from tensorflow.python.client import session
+from tensorflow.python.eager import backprop
 from tensorflow.python.eager import context
 from tensorflow.python.eager import tape
 from tensorflow.python.framework import device as pydev
@@ -56,10 +57,12 @@ from tensorflow.python.framework import random_seed
 from tensorflow.python.framework import versions
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import resource_variable_ops
+from tensorflow.python.ops import variables
 from tensorflow.python.platform import googletest
 from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.training import server_lib
 from tensorflow.python.util import compat
+from tensorflow.python.util import nest
 from tensorflow.python.util.protobuf import compare
 
 
@@ -453,6 +456,62 @@ class IsolateTest(object):
         type_arg, value_arg, traceback_arg)
 
 
+def assert_no_new_tensors(f):
+  """Decorator for asserting that no new Tensors persist after a test.
+
+  Mainly useful for checking that code using the Python C API has correctly
+  manipulated reference counts.
+
+  Clears the caches that it knows about, runs the garbage collector, then checks
+  that there are no Tensor or Tensor-like objects still around. This includes
+  Tensors to which something still has a reference (e.g. from missing
+  Py_DECREFs) and uncollectable cycles (i.e. Python reference cycles where one
+  of the objects has __del__ defined).
+
+  Args:
+    f: The test case to run.
+  Returns:
+    The decorated test case.
+  """
+
+  def decorator(self, **kwargs):
+    """Finds existing Tensors, runs the test, checks for new Tensors."""
+
+    def _is_tensor(obj):
+      try:
+        return (isinstance(obj, ops.Tensor) or
+                isinstance(obj, variables.Variable))
+      except ReferenceError:
+        # If the object no longer exists, we don't care about it.
+        return False
+
+    tensors_before = set(id(obj) for obj in gc.get_objects() if _is_tensor(obj))
+    outside_container_prefix = ops.get_default_graph()._container_prefix
+    with IsolateTest():
+      # Run the test in a new graph so that collections get cleared when it's
+      # done, but inherit the container prefix so that we can print the values
+      # of variables which get leaked when executing eagerly.
+      ops.get_default_graph()._container_prefix = outside_container_prefix
+      f(self, **kwargs)
+    # Make an effort to clear caches, which would otherwise look like leaked
+    # Tensors.
+    backprop._last_zero = [None]
+    backprop._shape_dtype = [None, None]
+    context.get_default_context().scalar_cache().clear()
+    gc.collect()
+    tensors_after = [
+        obj for obj in gc.get_objects()
+        if _is_tensor(obj) and id(obj) not in tensors_before
+    ]
+    if tensors_after:
+      raise AssertionError(("%d Tensors not deallocated after test: %s" % (
+          len(tensors_after),
+          str(tensors_after),
+      )))
+
+  return decorator
+
+
 def assert_no_garbage_created(f):
   """Test method decorator to assert that no garbage has been created.
 
@@ -507,7 +566,8 @@ def run_in_graph_and_eager_modes(
       garbage for legitimate reasons (e.g. they define a class which inherits
       from `object`), and because DEBUG_SAVEALL is sticky in some Python
       interpreters (meaning that tests which rely on objects being collected
-      elsewhere in the unit test file will not work).
+      elsewhere in the unit test file will not work). Additionally, checks that
+      nothing still has a reference to Tensors that the test allocated.
   Returns:
     Returns a decorator that will run the decorated test function
         using both a graph and using eager execution.
@@ -544,7 +604,8 @@ def run_in_graph_and_eager_modes(
             f(self, **kwargs)
 
       if assert_no_eager_garbage:
-        run_eager_mode = assert_no_garbage_created(run_eager_mode)
+        run_eager_mode = assert_no_new_tensors(
+            assert_no_garbage_created(run_eager_mode))
 
       with context.eager_mode():
         with IsolateTest():
@@ -715,23 +776,22 @@ class TensorFlowTestCase(googletest.TestCase):
       fail_msg += " : %r" % (msg) if msg else ""
       self.fail(fail_msg)
 
-  def _eval_helper(self, tensors):
-    if isinstance(tensors, ops.EagerTensor):
-      return tensors.numpy()
-    if isinstance(tensors, resource_variable_ops.ResourceVariable):
-      return tensors.read_value().numpy()
-
-    if isinstance(tensors, tuple):
-      return tuple([self._eval_helper(t) for t in tensors])
-    elif isinstance(tensors, list):
-      return [self._eval_helper(t) for t in tensors]
-    elif isinstance(tensors, dict):
-      assert not tensors, "Only support empty dict now."
-      return dict()
-    elif tensors is None:
+  def _eval_tensor(self, tensor):
+    if tensor is None:
       return None
+    elif isinstance(tensor, ops.EagerTensor):
+      return tensor.numpy()
+    elif isinstance(tensor, resource_variable_ops.ResourceVariable):
+      return tensor.read_value().numpy()
+    elif callable(tensor):
+      return self._eval_helper(tensor())
     else:
-      raise ValueError("Unsupported type %s." % type(tensors))
+      raise ValueError("Unsupported type %s." % type(tensor))
+
+  def _eval_helper(self, tensors):
+    if tensors is None:
+      return None
+    return nest.map_structure(self._eval_tensor, tensors)
 
   def evaluate(self, tensors):
     """Evaluates tensors and returns numpy values.
@@ -985,10 +1045,9 @@ class TensorFlowTestCase(googletest.TestCase):
       msg: An optional string message to append to the failure message.
     """
     # f1 == f2 is needed here as we might have: f1, f2 = inf, inf
-    self.assertTrue(
-        f1 == f2 or math.fabs(f1 - f2) <= err,
-        "%f != %f +/- %f%s" % (f1, f2, err, " (%s)" % msg
-                               if msg is not None else ""))
+    self.assertTrue(f1 == f2 or math.fabs(f1 - f2) <= err,
+                    "%f != %f +/- %f%s" % (f1, f2, err, " (%s)" % msg
+                                           if msg is not None else ""))
 
   def assertArrayNear(self, farray1, farray2, err):
     """Asserts that two float arrays are near each other.
