@@ -33,6 +33,7 @@ bool ResolveConstantUnaryOperator::Run(Model* model, std::size_t op_index) {
   const auto* unary_op = unary_it->get();
   // Test for unary ops of types that we know how to resolve
   if (unary_op->type != OperatorType::kCast &&
+      unary_op->type != OperatorType::kNeg &&
       unary_op->type != OperatorType::kTensorFlowRsqrt &&
       unary_op->type != OperatorType::kTensorFlowSqrt &&
       unary_op->type != OperatorType::kTensorFlowSquare &&
@@ -137,15 +138,34 @@ bool ResolveConstantUnaryOperator::Run(Model* model, std::size_t op_index) {
     memcpy(output_float_data.data(), (*input_float_data).data(),
            output_buffer_size * sizeof(output_float_data[0]));
   } else if (unary_op->type == OperatorType::kTensorFlowSum) {
-    // At the moment only full reduction across all dimensions is supported.
-    for (int i = 0; i < output_dims_count; i++) {
-      CHECK_EQ(output_shape.dims(i), 1);
+    CHECK_EQ(unary_op->inputs.size(), 2) << "Sum needs 2 inputs";
+    if (!IsConstantParameterArray(*model, unary_op->inputs[1])) {
+      AddMessageF("Axis input is non-constant");
+      return false;
     }
-    float sum = 0.f;
-    for (int i = 0; i < input_buffer_size; i++) {
-      sum += (*input_float_data)[i];
+    auto& axis_array = model->GetArray(unary_op->inputs[1]);
+    CHECK(axis_array.data_type == ArrayDataType::kInt32);
+    int axis = axis_array.GetBuffer<ArrayDataType::kInt32>().data[0];
+    CHECK_LT(axis, input_shape.dimensions_count()) << "Axis out of bounds";
+
+    // We currently only handle reduction on axis 0.
+    CHECK_EQ(axis, 0) << "Only reduction along axis 0 is supported";
+    // We currently only handle 1-D and 2-D input tensors.
+    CHECK_LE(input_shape.dimensions_count(), 2) << "Rank >2 not yet supported";
+    // We only support keep_dims=true; shape prop will need to change otherwise.
+    auto sum_op = static_cast<const TensorFlowSumOperator*>(unary_op);
+    CHECK(sum_op->keep_dims) << "Only keep_dims=true is supported";
+
+    std::vector<int> indices(input_shape.dimensions_count());
+    for (int i = 0; i < input_shape.dims(1); ++i) {
+      indices[1] = i;
+      float sum = 0.f;
+      for (int j = 0; j < input_shape.dims(0); ++j) {
+        indices[0] = j;
+        sum += (*input_float_data)[Offset(input_shape, indices)];
+      }
+      output_float_data[i] = sum;
     }
-    output_float_data[0] = sum;
   } else if (unary_op->type == OperatorType::kTensorFlowMin) {
     // At the moment only full reduction across all dimensions is supported.
     // TODO(starka): Output should not be padded.
@@ -168,7 +188,8 @@ bool ResolveConstantUnaryOperator::Run(Model* model, std::size_t op_index) {
       max = std::max(max, (*input_float_data)[i]);
     }
     output_float_data[0] = max;
-  } else if (unary_op->type == OperatorType::kTensorFlowRsqrt ||
+  } else if (unary_op->type == OperatorType::kNeg ||
+             unary_op->type == OperatorType::kTensorFlowRsqrt ||
              unary_op->type == OperatorType::kTensorFlowSqrt ||
              unary_op->type == OperatorType::kTensorFlowSquare) {
     // Element-wise ops. Should have perfectly matching sizes here.
@@ -179,7 +200,9 @@ bool ResolveConstantUnaryOperator::Run(Model* model, std::size_t op_index) {
     for (int i = 0; i < output_buffer_size; i++) {
       const float val = (*input_float_data)[i];
       float outval = 0.f;
-      if (unary_op->type == OperatorType::kTensorFlowRsqrt) {
+      if (unary_op->type == OperatorType::kNeg) {
+        outval = -val;
+      } else if (unary_op->type == OperatorType::kTensorFlowRsqrt) {
         outval = 1.0f / std::sqrt(val);
       } else if (unary_op->type == OperatorType::kTensorFlowSqrt) {
         outval = std::sqrt(val);
@@ -195,7 +218,7 @@ bool ResolveConstantUnaryOperator::Run(Model* model, std::size_t op_index) {
   }
   for (const auto& input : unary_op->inputs) {
     if (CountOpsWithInput(*model, input) == 1) {
-      model->arrays.erase(input);
+      model->EraseArray(input);
     }
   }
   AddMessageF("Resolved constant %s to the equivalent constant array",

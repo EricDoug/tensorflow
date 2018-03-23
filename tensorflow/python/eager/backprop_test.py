@@ -23,7 +23,6 @@ import numpy as np
 from tensorflow.python import pywrap_tensorflow
 from tensorflow.python.eager import backprop
 from tensorflow.python.eager import context
-from tensorflow.python.eager import custom_gradient
 from tensorflow.python.eager import tape
 from tensorflow.python.eager import test
 from tensorflow.python.framework import constant_op
@@ -32,6 +31,7 @@ from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import custom_gradient
 from tensorflow.python.ops import embedding_ops
 from tensorflow.python.ops import gradients
 from tensorflow.python.ops import math_ops
@@ -45,6 +45,7 @@ from tensorflow.python.training import training
 
 class BackpropTest(test.TestCase):
 
+  @test_util.run_in_graph_and_eager_modes()
   def testAggregateGradients(self):
 
     def fn(x):
@@ -61,7 +62,7 @@ class BackpropTest(test.TestCase):
     var_np = np.random.rand(4, 2).astype(np.float32)
     var = constant_op.constant(var_np)
     grad = backprop.gradients_function(fn, [0])(var)[0]
-    grad = ops.convert_to_tensor(grad).numpy()
+    grad = self.evaluate(ops.convert_to_tensor(grad))
 
     with context.graph_mode(), self.test_session():
       tf_var = array_ops.constant(var_np, dtypes.float32)
@@ -114,6 +115,19 @@ class BackpropTest(test.TestCase):
     with self.assertRaises(RuntimeError):
       backprop.gradients_function(f)(constant_op.constant(1.0))
 
+  def testGradientsFunctionInCustomGradient(self):
+
+    @custom_gradient.custom_gradient
+    def f(x):
+      (y,) = backprop.gradients_function(lambda x: x * x)(x)
+
+      def grad(dy):
+        return [2 * dy]
+
+      return y, grad
+
+    self.assertAllEqual(f(1.0), 2.0)
+
   def testImplicitGradOverEmbeddingLookup(self):
     batch_size = 8
     embedding_size = 512
@@ -151,6 +165,20 @@ class BackpropTest(test.TestCase):
       expected = tf_embedding.eval()
     opt.apply_gradients([(grad, embedding)])
     self.assertAllClose(expected, embedding.read_value())
+
+  def testImplicitGradOrdering(self):
+    v0 = resource_variable_ops.ResourceVariable(1.0)
+    v1 = resource_variable_ops.ResourceVariable(2.0)
+
+    def f():
+      x = v1 * v1
+      y = v0 * v0
+      return x + y
+
+    grads = backprop.implicit_grad(f)()
+    ordered_variables = [x[1] for x in grads]
+    self.assertTrue(ordered_variables[0] is v0)
+    self.assertTrue(ordered_variables[1] is v1)
 
   @test_util.assert_no_new_tensors
   def testGradientNone(self):
@@ -190,10 +218,21 @@ class BackpropTest(test.TestCase):
     def f(x):
       return x * x
 
-    wrapped_fn = backprop.make_vjp(f)
+    wrapped_fn = backprop.make_vjp(f, persistent=False)
     result, vjp = wrapped_fn(constant_op.constant(3.0))
     self.assertAllEqual(result, 9.0)
     self.assertAllEqual(vjp(2.0)[0], 12.0)
+
+  def testPersistentMakeVJP(self):
+
+    def f(x):
+      return x * x
+
+    wrapped_fn = backprop.make_vjp(f, persistent=True)
+    _, vjp = wrapped_fn(constant_op.constant(3.0))
+    vjp_result1 = vjp(2.0)[0]
+    vjp_result2 = vjp(2.0)[0]
+    self.assertAllEqual(vjp_result1, vjp_result2, 12.0)
 
   @test_util.assert_no_new_tensors
   def testGradGrad(self):
